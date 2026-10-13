@@ -1,0 +1,41 @@
+# Router Prior Bias (RPB)
+# Copyright (c) 2026-present NAVER Corp.
+# Apache-2.0
+
+[project]
+name = "rpb-megatron-patch-tools"
+version = "0.1.0"
+description = "Utilities and tests for the Router Prior Bias Megatron-Bridge patch"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24,<3",
+  "pyyaml>=6,<7",
+  "torch>=2.2",
+]
+
+[project.optional-dependencies]
+prior = [
+  "accelerate>=1.0,<2",
+  "tiktoken>=0.7,<1",
+  "transformers>=4.57,<4.58",
+]
+test = [
+  "pytest>=8.4,<9",
+  "ruff>=0.13,<0.14",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100

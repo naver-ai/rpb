@@ -1,0 +1,768 @@
+# Router Prior Bias (RPB)
+# Copyright (c) 2026-present NAVER Corp.
+# Apache-2.0
+
+# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Portions of the routing and SFT integration in this file are adapted from
+# NVIDIA Megatron-LM (BSD 3-Clause) and NVIDIA Megatron-Bridge (Apache-2.0).
+# Megatron-LM portions: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES.
+# Megatron-Bridge portions: Copyright (c) 2024-2025 NVIDIA CORPORATION.
+# See THIRD_PARTY_NOTICES.md in the RPB release repository for exact sources,
+# revisions, copyright notices, and license terms.
+
+"""Router Prior Bias support for Megatron-Bridge supervised fine-tuning.
+
+This module is intentionally self-contained so the numerical core can be
+tested on CPU. Megatron-specific imports are delayed until integration is
+enabled.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+from pathlib import Path
+from typing import Any
+
+import torch
+
+
+@dataclass(frozen=True)
+class RPBConfig:
+    prior_path: str
+    beta: float = 1.0
+    eps: float = 0.05
+    c: float = 5.0
+    route_only: bool = True
+
+    def validate(self) -> "RPBConfig":
+        if self.beta < 0:
+            raise ValueError(f"RPB beta must be non-negative, got {self.beta}")
+        if self.eps <= 0:
+            raise ValueError(f"RPB eps must be positive, got {self.eps}")
+        if self.c <= 0:
+            raise ValueError(f"RPB c must be positive, got {self.c}")
+        if self.eps > self.c:
+            raise ValueError(f"RPB eps must not exceed c, got eps={self.eps} c={self.c}")
+        if not self.prior_path:
+            raise ValueError("RPB prior_path must not be empty")
+        if self.route_only is not True:
+            raise ValueError("this RPB release requires route_only=True")
+        return self
+
+
+@dataclass(frozen=True)
+class RPBBatchContext:
+    sample_ids: torch.Tensor
+    span_ids: torch.Tensor
+
+
+_CONTEXT: RPBBatchContext | None = None
+
+
+def set_batch_context(context: RPBBatchContext | None) -> None:
+    global _CONTEXT
+    _CONTEXT = context
+
+
+def get_batch_context() -> RPBBatchContext | None:
+    return _CONTEXT
+
+
+QUESTION_SPAN = 0
+ANSWER_SPAN = 2
+STRUCTURAL_SPAN = -1
+
+
+def _marker_id(tokenizer: Any, token: str) -> int:
+    if hasattr(tokenizer, "convert_tokens_to_ids"):
+        token_id = tokenizer.convert_tokens_to_ids(token)
+    elif hasattr(tokenizer, "token_to_id"):
+        token_id = tokenizer.token_to_id(token)
+    else:
+        raise TypeError("tokenizer cannot convert Moonlight markers to IDs")
+    if token_id is None or token_id == getattr(tokenizer, "unk_token_id", None):
+        raise ValueError(f"tokenizer is missing required marker {token!r}")
+    return int(token_id)
+
+
+def detect_spans(token_ids: list[int], tokenizer: Any) -> list[int]:
+    """Label Moonlight semantic Q/A bodies and leave chat-control tokens structural."""
+    user = _marker_id(tokenizer, "<|im_user|>")
+    assistant = _marker_id(tokenizer, "<|im_assistant|>")
+    system = _marker_id(tokenizer, "<|im_system|>")
+    middle = _marker_id(tokenizer, "<|im_middle|>")
+    end = _marker_id(tokenizer, "<|im_end|>")
+    labels = {user: QUESTION_SPAN, assistant: ANSWER_SPAN, system: None}
+    spans = [STRUCTURAL_SPAN] * len(token_ids)
+    cursor = 0
+    while cursor < len(token_ids):
+        if token_ids[cursor] not in labels:
+            cursor += 1
+            continue
+        middle_index = next(
+            (index for index in range(cursor + 1, len(token_ids)) if token_ids[index] == middle),
+            -1,
+        )
+        if middle_index < 0:
+            break
+        end_index = next(
+            (index for index in range(middle_index + 1, len(token_ids)) if token_ids[index] == end),
+            len(token_ids),
+        )
+        label = labels[token_ids[cursor]]
+        if label is not None:
+            spans[middle_index + 1 : end_index] = [label] * (end_index - middle_index - 1)
+        cursor = end_index + 1
+    return spans
+
+
+def _unwrap_hf_tokenizer(tokenizer: Any) -> Any:
+    current = tokenizer
+    seen: set[int] = set()
+    while id(current) not in seen:
+        seen.add(id(current))
+        if hasattr(current, "encode") and hasattr(current, "convert_tokens_to_ids"):
+            return current
+        inner = getattr(current, "_tokenizer", None)
+        if inner is None:
+            inner = getattr(current, "tokenizer", None)
+        if inner is None or inner is current:
+            break
+        current = inner
+    return current
+
+
+def _encode_no_special(tokenizer: Any, text: str) -> list[int]:
+    if hasattr(tokenizer, "encode"):
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    if hasattr(tokenizer, "text_to_ids"):
+        return list(tokenizer.text_to_ids(text))
+    raise TypeError("tokenizer cannot encode text")
+
+
+def _process_paper_example(dataset: Any, example: dict[str, Any]) -> dict[str, Any]:
+    input_text = example.get("input")
+    output_text = example.get(dataset.label_key)
+    if not isinstance(input_text, str) or not isinstance(output_text, str):
+        raise ValueError("RPB SFT rows must contain string input/output fields")
+    tokenizer = _unwrap_hf_tokenizer(dataset.tokenizer)
+    full_ids = _encode_no_special(tokenizer, input_text + output_text)
+    full_ids = full_ids[: int(dataset.max_seq_length)]
+    spans = detect_spans(full_ids, tokenizer)
+    try:
+        answer_start = spans.index(ANSWER_SPAN)
+    except ValueError:
+        answer_start = len(full_ids)
+    input_ids = list(full_ids)
+    if dataset.add_eos:
+        input_ids.append(int(dataset.tokenizer.eos_id))
+    metadata = {
+        key: value for key, value in example.items() if key not in {"input", dataset.label_key}
+    }
+    return {
+        "input_ids": input_ids,
+        "answer_start_idx": answer_start,
+        "context_ids": input_ids[:answer_start],
+        "context_length": answer_start,
+        "answer_ids": input_ids[answer_start:],
+        "metadata": metadata,
+        "token_count": len(input_ids),
+    }
+
+
+def _torch_load_cpu(path: Path) -> Any:
+    try:
+        return torch.load(str(path), map_location="cpu", weights_only=True, mmap=True)
+    except TypeError:
+        return torch.load(str(path), map_location="cpu", weights_only=True)
+
+
+def data_sha256(paths: list[str | Path]) -> str:
+    """Hash ordered file contents using the public prior artifact convention."""
+    digest = hashlib.sha256()
+    for raw_path in paths:
+        content = Path(raw_path).read_bytes()
+        digest.update(len(content).to_bytes(8, byteorder="big"))
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def prior_to_zero_mean_log_bias(
+    prior: torch.Tensor,
+    *,
+    eps: float,
+    c: float,
+) -> torch.Tensor:
+    if prior.ndim < 1 or prior.shape[-1] < 1:
+        raise ValueError("RPB prior must have a non-empty expert dimension")
+    if eps <= 0 or c <= 0 or eps > c:
+        raise ValueError(f"RPB clamp requires 0 < eps <= c, got eps={eps} c={c}")
+    values = prior.float().clamp_min(0)
+    num_experts = int(values.shape[-1])
+    values = values.clamp(min=eps / num_experts, max=c / num_experts)
+    values = values / values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    log_prior = values.clamp_min(1e-12).log()
+    return log_prior - log_prior.mean(dim=-1, keepdim=True)
+
+
+class RPBPrior:
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if not self.path.is_file():
+            raise FileNotFoundError(f"RPB prior not found: {self.path}")
+        payload = _torch_load_cpu(self.path)
+        if not isinstance(payload, dict):
+            raise TypeError("RPB prior file must contain a dictionary")
+        prior = payload.get("prior_qa")
+        if not isinstance(prior, torch.Tensor):
+            raise TypeError("RPB prior dictionary must contain tensor key 'prior_qa'")
+        if prior.ndim != 4 or prior.shape[1] != 2:
+            raise ValueError(f"RPB prior_qa must have shape [N, 2, L, E], got {tuple(prior.shape)}")
+        if not bool(torch.isfinite(prior).all()) or bool((prior < 0).any()):
+            raise ValueError("RPB prior must contain finite, non-negative values")
+        metadata = dict(payload.get("metadata") or {})
+        if int(metadata.get("n_missing_uniform_fill", 0) or 0):
+            raise ValueError("RPB prior contains missing rows filled with a uniform prior")
+        if metadata.get("schema") not in {"rpb_prior_v1", "rpb_prior_v2"}:
+            raise ValueError("RPB prior metadata must use schema 'rpb_prior_v1' or 'rpb_prior_v2'")
+        if metadata["schema"] == "rpb_prior_v1":
+            metadata["router_score_function"] = metadata.get("score_function")
+            metadata["prior_score_function"] = metadata.get("score_function")
+        if metadata.get("shape") != list(prior.shape):
+            raise ValueError("RPB prior metadata shape does not match prior_qa")
+        if metadata.get("span_names") != ["question", "answer"]:
+            raise ValueError("RPB prior metadata must define question/answer spans")
+        required_metadata = (
+            "model_id",
+            "tokenizer_id",
+            "family",
+            "router_score_function",
+            "prior_score_function",
+            "top_k",
+            "max_seq_len",
+            "data_sha256",
+        )
+        missing = [key for key in required_metadata if metadata.get(key) in (None, "")]
+        if missing:
+            raise ValueError(f"RPB prior metadata is missing required fields: {missing}")
+        if metadata["family"] != "moonlight":
+            raise ValueError("RPB prior family must be moonlight")
+        if metadata["router_score_function"] != "sigmoid":
+            raise ValueError("Moonlight runtime router score function must be sigmoid")
+        if metadata["prior_score_function"] != "sigmoid":
+            raise ValueError("Moonlight prior score function must be sigmoid")
+        sums = prior.float().sum(dim=-1)
+        if not torch.allclose(sums, torch.ones_like(sums), atol=5e-3, rtol=0):
+            raise ValueError("RPB prior probabilities must sum to one over experts")
+        self.prior = prior.cpu()
+        self.metadata = metadata
+        self.num_samples = int(prior.shape[0])
+        self.num_layers = int(prior.shape[2])
+        self.num_experts = int(prior.shape[3])
+
+    def log_bias_for_layer(
+        self,
+        sample_ids: torch.Tensor,
+        layer_index: int,
+        *,
+        eps: float,
+        c: float,
+    ) -> torch.Tensor:
+        if layer_index < 0 or layer_index >= self.num_layers:
+            raise IndexError(
+                f"RPB layer index out of range: {layer_index} not in [0, {self.num_layers})"
+            )
+        ids = sample_ids.detach().to(device="cpu", dtype=torch.long)
+        valid = (ids >= 0) & (ids < self.num_samples)
+        if not bool(valid.all()):
+            bad = ids[~valid][:8].tolist()
+            raise IndexError(
+                f"RPB sample id out of range: bad={bad} num_samples={self.num_samples}"
+            )
+        selected = self.prior[ids, :, layer_index, :]
+        return prior_to_zero_mean_log_bias(selected, eps=eps, c=c)
+
+
+def _tensor_parallel_rank_and_size() -> tuple[int, int]:
+    try:
+        from megatron.core import parallel_state
+
+        return (
+            int(parallel_state.get_tensor_model_parallel_rank()),
+            int(parallel_state.get_tensor_model_parallel_world_size()),
+        )
+    except Exception:
+        return 0, 1
+
+
+def select_span_ids_for_router_logits(
+    batch_span_ids: torch.Tensor,
+    seq_len: int,
+    router: Any,
+) -> torch.Tensor:
+    full_len = int(batch_span_ids.shape[1])
+    if full_len == seq_len:
+        return batch_span_ids
+    if full_len < seq_len:
+        padded = torch.full(
+            (batch_span_ids.shape[0], seq_len),
+            -1,
+            dtype=batch_span_ids.dtype,
+            device=batch_span_ids.device,
+        )
+        padded[:, :full_len] = batch_span_ids
+        return padded
+    config = getattr(router, "config", None)
+    if bool(getattr(config, "sequence_parallel", False)):
+        tp_rank, tp_size = _tensor_parallel_rank_and_size()
+        if tp_size > 1 and full_len == seq_len * tp_size:
+            start = tp_rank * seq_len
+            return batch_span_ids[:, start : start + seq_len]
+    raise RuntimeError(
+        "RPB span_ids length does not match router logits: "
+        f"span_ids length={full_len}, router sequence length={seq_len}"
+    )
+
+
+def build_token_bias(
+    prior: RPBPrior,
+    context: RPBBatchContext,
+    *,
+    layer_index: int,
+    seq_len: int,
+    router: Any,
+    eps: float,
+    c: float,
+    beta: float,
+) -> torch.Tensor:
+    batch_size = int(context.sample_ids.numel())
+    if context.span_ids.ndim != 2 or context.span_ids.shape[0] != batch_size:
+        raise RuntimeError(
+            "RPB batch context shape mismatch: "
+            f"sample_ids={tuple(context.sample_ids.shape)} "
+            f"span_ids={tuple(context.span_ids.shape)}"
+        )
+    layer_bias = prior.log_bias_for_layer(
+        context.sample_ids,
+        layer_index,
+        eps=eps,
+        c=c,
+    )
+    span_ids = select_span_ids_for_router_logits(context.span_ids, seq_len, router)
+    bias = torch.zeros(
+        (batch_size, seq_len, prior.num_experts),
+        device=span_ids.device,
+        dtype=layer_bias.dtype,
+    )
+    layer_bias = layer_bias.to(span_ids.device)
+    for runtime_span, prior_span in ((0, 0), (2, 1)):
+        value = layer_bias[:, prior_span, :].unsqueeze(1).expand_as(bias)
+        bias = torch.where((span_ids == runtime_span).unsqueeze(-1), value, bias)
+    return bias.transpose(0, 1).contiguous() * float(beta)
+
+
+def _group_limited_indices(
+    scores: torch.Tensor,
+    *,
+    topk: int,
+    num_groups: int | None,
+    group_topk: int | None,
+) -> torch.Tensor:
+    if not group_topk:
+        return torch.topk(scores, k=topk, dim=-1).indices
+    if not num_groups or scores.shape[-1] % num_groups:
+        raise ValueError("RPB grouped routing requires experts divisible by num_groups")
+    if topk % group_topk:
+        raise ValueError("RPB grouped routing requires topk divisible by group_topk")
+    num_tokens, num_experts = scores.shape
+    group_scores = (
+        scores.view(num_tokens, num_groups, -1).topk(topk // group_topk, dim=-1).values.sum(dim=-1)
+    )
+    selected_groups = torch.topk(group_scores, k=group_topk, dim=-1).indices
+    group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+    group_mask.scatter_(1, selected_groups, True)
+    expert_mask = (
+        group_mask.unsqueeze(-1)
+        .expand(num_tokens, num_groups, num_experts // num_groups)
+        .reshape(num_tokens, num_experts)
+    )
+    return torch.topk(scores.masked_fill(~expert_mask, float("-inf")), k=topk, dim=-1).indices
+
+
+def route_only_topk(
+    logits: torch.Tensor,
+    bias: torch.Tensor,
+    *,
+    topk: int,
+    num_groups: int | None = None,
+    group_topk: int | None = None,
+    scaling_factor: float | None = None,
+    expert_bias: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if logits.ndim != 2 or logits.shape != bias.shape:
+        raise ValueError(
+            f"RPB routing expects matching [tokens, experts] tensors, got "
+            f"logits={tuple(logits.shape)} bias={tuple(bias.shape)}"
+        )
+    route_logits = logits + bias.to(device=logits.device, dtype=logits.dtype)
+    selection_scores = torch.sigmoid(route_logits.float()).type_as(logits)
+    if expert_bias is not None:
+        selection_scores = selection_scores + expert_bias
+    top_indices = _group_limited_indices(
+        selection_scores,
+        topk=topk,
+        num_groups=num_groups,
+        group_topk=group_topk,
+    )
+
+    base_scores = torch.sigmoid(logits.float()).type_as(logits)
+    weights = torch.gather(base_scores, 1, top_indices)
+    if topk > 1:
+        weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    if scaling_factor is not None:
+        weights = weights * float(scaling_factor)
+    probs = torch.zeros_like(logits).scatter(1, top_indices, weights)
+    routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
+    return probs, routing_map
+
+
+def _iter_topk_routers(model_chunks: list[torch.nn.Module]):
+    for model_chunk in model_chunks:
+        for module in model_chunk.modules():
+            if type(module).__name__.endswith("TopKRouter") and hasattr(module, "routing"):
+                yield module
+
+
+def install_rpb_on_model(
+    model_chunks: list[torch.nn.Module],
+    config: RPBConfig,
+    *,
+    prior: RPBPrior | None = None,
+) -> dict[str, int]:
+    config.validate()
+    reference = prior or RPBPrior(config.prior_path)
+    routers = list(_iter_topk_routers(model_chunks))
+    if len(routers) != reference.num_layers:
+        raise ValueError(
+            "RPB prior layer count does not match model routers: "
+            f"prior={reference.num_layers} routers={len(routers)}"
+        )
+    for layer_index, router in enumerate(routers):
+        router_config = getattr(router, "config", None)
+        if int(getattr(router_config, "num_moe_experts", -1)) != reference.num_experts:
+            raise ValueError(
+                "RPB prior expert count does not match router: "
+                f"prior={reference.num_experts} "
+                f"router={getattr(router_config, 'num_moe_experts', None)}"
+            )
+        if str(getattr(router, "score_function", "")) != "sigmoid":
+            raise ValueError("Moonlight RPB requires a sigmoid router")
+        # Megatron's pre-softmax flag only changes the softmax branch. Moonlight
+        # uses sigmoid routing, so preserve the provider/checkpoint value.
+        if int(getattr(router, "topk", -1)) != int(reference.metadata["top_k"]):
+            raise ValueError(
+                "RPB prior top-k does not match router: "
+                f"prior={reference.metadata['top_k']} router={getattr(router, 'topk', None)}"
+            )
+        if getattr(router_config, "moe_expert_capacity_factor", None) is not None:
+            raise ValueError("RPB does not support token dropping")
+        if hasattr(router, "is_aux_loss_enabled") and router.is_aux_loss_enabled():
+            raise ValueError("RPB requires auxiliary router loss to be disabled")
+        if (
+            bool(getattr(router, "enable_expert_bias", False))
+            and float(getattr(router_config, "moe_router_bias_update_rate", 0.0) or 0.0) != 0.0
+        ):
+            raise ValueError("RPB requires native expert-bias updates to be disabled")
+        if getattr(router, "_rpb_original_routing", None) is not None:
+            raise RuntimeError("RPB is already installed on this router")
+        original_routing = router.routing
+
+        def routing_with_rpb(
+            logits: torch.Tensor,
+            padding_mask: torch.Tensor | None = None,
+            *,
+            _router=router,
+            _layer_index=layer_index,
+            _original_routing=original_routing,
+        ):
+            if not _router.training:
+                return _original_routing(logits, padding_mask=padding_mask)
+            context = get_batch_context()
+            if context is None:
+                raise RuntimeError("RPB is enabled but no RPB batch context is available")
+            seq_len, batch_size, num_experts = logits.shape
+            if context.sample_ids.numel() != batch_size:
+                raise RuntimeError("RPB sample IDs do not match router batch size")
+            bias = build_token_bias(
+                reference,
+                context,
+                layer_index=_layer_index,
+                seq_len=seq_len,
+                router=_router,
+                eps=config.eps,
+                c=config.c,
+                beta=config.beta,
+            ).to(device=logits.device, dtype=logits.dtype)
+            flat_logits = logits.reshape(-1, num_experts)
+            flat_logits = _router.apply_z_loss(
+                flat_logits,
+                padding_mask=(padding_mask.reshape(-1) if padding_mask is not None else None),
+            )
+            return route_only_topk(
+                flat_logits,
+                bias.reshape(-1, num_experts),
+                topk=int(_router.topk),
+                num_groups=getattr(_router.config, "moe_router_num_groups", None),
+                group_topk=getattr(_router.config, "moe_router_group_topk", None),
+                scaling_factor=getattr(_router.config, "moe_router_topk_scaling_factor", None),
+                expert_bias=getattr(_router, "expert_bias", None),
+            )
+
+        router._rpb_original_routing = original_routing
+        router.routing = routing_with_rpb
+        router._rpb_layer_index = layer_index
+    return {"wrapped_routers": len(routers)}
+
+
+def _resolve_sample_id(dataset: Any, idx: Any) -> int:
+    if hasattr(idx, "item"):
+        idx = idx.item()
+    mapped = int(idx)
+    samples_mapping = getattr(dataset, "samples_mapping", None)
+    if samples_mapping is not None:
+        mapped_value = samples_mapping[mapped]
+        if isinstance(mapped_value, (tuple, list)):
+            mapped_value = mapped_value[0]
+        elif hasattr(mapped_value, "reshape"):
+            mapped_value = mapped_value.reshape(-1)[0]
+        if hasattr(mapped_value, "item"):
+            mapped_value = mapped_value.item()
+        mapped = int(mapped_value)
+    if mapped < 0:
+        mapped = len(dataset) + mapped
+    return mapped
+
+
+def _pad_or_truncate_1d(
+    values: torch.Tensor,
+    length: int,
+    *,
+    pad_value: int,
+) -> torch.Tensor:
+    values = values.reshape(-1)
+    if values.numel() >= length:
+        return values[:length]
+    padding = torch.full(
+        (length - values.numel(),),
+        pad_value,
+        dtype=values.dtype,
+        device=values.device,
+    )
+    return torch.cat((values, padding), dim=0)
+
+
+def patch_sft_dataset_class(dataset_cls: type) -> None:
+    if dataset_cls.__dict__.get("_rpb_patched", False):
+        return
+    original_getitem = dataset_cls.__getitem__
+    original_collate_fn = dataset_cls.collate_fn
+    original_process_example = getattr(dataset_cls, "_process_example", None)
+
+    def patched_getitem(self, idx):
+        sample_id = _resolve_sample_id(self, idx)
+        item = original_getitem(self, idx)
+        input_ids = item.get("input_ids")
+        answer_start = item.get("answer_start_idx")
+        if input_ids is None or answer_start is None:
+            raise ValueError("RPB requires input_ids and answer_start_idx from GPTSFTDataset")
+        token_length = max(len(input_ids) - 1, 0)
+        answer_start = min(max(int(answer_start), 0), token_length)
+        item["rpb_sample_id"] = sample_id
+        if not hasattr(self, "tokenizer"):
+            span_ids = [QUESTION_SPAN] * answer_start + [ANSWER_SPAN] * (
+                token_length - answer_start
+            )
+        else:
+            span_ids = detect_spans(
+                [int(token_id) for token_id in input_ids[:token_length]],
+                _unwrap_hf_tokenizer(self.tokenizer),
+            )
+        item["rpb_span_ids"] = torch.tensor(span_ids, dtype=torch.long)
+        return item
+
+    def patched_process_example(self, example):
+        return _process_paper_example(self, example)
+
+    def patched_collate_fn(self, batch):
+        processed = original_collate_fn(self, batch)
+        tokens = processed.get("tokens")
+        if tokens is None:
+            tokens = processed.get("input_ids")
+        if tokens is None:
+            raise ValueError("RPB could not find tokens in the collated SFT batch")
+        seq_len = int(tokens.shape[1])
+        processed["rpb_sample_ids"] = torch.tensor(
+            [int(item["rpb_sample_id"]) for item in batch], dtype=torch.long
+        )
+        processed["rpb_span_ids"] = torch.stack(
+            [_pad_or_truncate_1d(item["rpb_span_ids"], seq_len, pad_value=-1) for item in batch]
+        )
+        return processed
+
+    dataset_cls.__getitem__ = patched_getitem
+    dataset_cls.collate_fn = patched_collate_fn
+    if original_process_example is not None:
+        dataset_cls._process_example = patched_process_example
+    dataset_cls._rpb_patched = True
+    dataset_cls._rpb_original_getitem = original_getitem
+    dataset_cls._rpb_original_collate_fn = original_collate_fn
+    dataset_cls._rpb_original_process_example = original_process_example
+
+
+def patch_vlm_step_module(vlm_module: Any) -> None:
+    if getattr(vlm_module, "_rpb_patched", False):
+        return
+    original_get_batch_from_iterator = vlm_module.get_batch_from_iterator
+    original_get_batch = vlm_module.get_batch
+    pending: dict[str, torch.Tensor | None] = {}
+
+    def patched_get_batch_from_iterator(data_iterator, *args, **kwargs):
+        raw_batch = next(data_iterator)
+        pending.clear()
+        pending.update(
+            sample_ids=raw_batch.get("rpb_sample_ids"),
+            span_ids=raw_batch.get("rpb_span_ids"),
+        )
+        return original_get_batch_from_iterator(iter([raw_batch]), *args, **kwargs)
+
+    def patched_get_batch(data_iterator, *args, **kwargs):
+        result = original_get_batch(data_iterator, *args, **kwargs)
+        tokens = result[0] if isinstance(result, tuple) and result else None
+        sample_ids = pending.get("sample_ids")
+        span_ids = pending.get("span_ids")
+        pending.clear()
+        if tokens is None or sample_ids is None or span_ids is None:
+            set_batch_context(None)
+            return result
+        seq_len = int(tokens.shape[1])
+        padded_spans = torch.stack(
+            [_pad_or_truncate_1d(row.long(), seq_len, pad_value=-1) for row in span_ids]
+        )
+        set_batch_context(
+            RPBBatchContext(
+                sample_ids=sample_ids.long().to(tokens.device, non_blocking=True),
+                span_ids=padded_spans.to(tokens.device, non_blocking=True),
+            )
+        )
+        return result
+
+    vlm_module.get_batch_from_iterator = patched_get_batch_from_iterator
+    vlm_module.get_batch = patched_get_batch
+    vlm_module._rpb_patched = True
+    vlm_module._rpb_original_get_batch_from_iterator = original_get_batch_from_iterator
+    vlm_module._rpb_original_get_batch = original_get_batch
+
+
+def _has_nonzero_aux_coefficient(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (tuple, list)):
+        return any(float(item) != 0.0 for item in value)
+    return float(value) != 0.0
+
+
+def validate_bridge_config(config: Any, rpb: RPBConfig) -> None:
+    rpb.validate()
+    dataset = config.dataset
+    model = config.model
+    if bool(getattr(dataset, "pack_sequences_in_batch", False)):
+        raise ValueError("RPB requires packing to be disabled")
+    if int(getattr(model, "pipeline_model_parallel_size", 1)) != 1:
+        raise ValueError("RPB requires pipeline parallelism size 1")
+    if int(getattr(model, "context_parallel_size", 1)) != 1:
+        raise ValueError("RPB requires context parallelism size 1")
+    load_balancing = getattr(model, "moe_router_load_balancing_type", None)
+    if load_balancing not in (None, "none") or _has_nonzero_aux_coefficient(
+        getattr(model, "moe_aux_loss_coeff", None)
+    ):
+        raise ValueError("RPB requires auxiliary router loss to be disabled")
+    if (
+        bool(getattr(model, "moe_router_enable_expert_bias", False))
+        and float(getattr(model, "moe_router_bias_update_rate", 0.0) or 0.0) != 0.0
+    ):
+        raise ValueError("RPB requires native expert-bias updates to be disabled")
+
+
+def validate_prior_alignment(config: Any, prior: RPBPrior) -> None:
+    """Refuse training when the prior, dataset, and model contract diverge."""
+    dataset_root = getattr(config.dataset, "dataset_root", None)
+    if dataset_root is None:
+        raise ValueError("RPB requires dataset.dataset_root")
+    training_path = Path(dataset_root) / "training.jsonl"
+    if not training_path.is_file():
+        raise FileNotFoundError(f"RPB training data not found: {training_path}")
+    actual_hash = data_sha256([training_path])
+    if actual_hash != prior.metadata["data_sha256"]:
+        raise ValueError("RPB data SHA-256 does not match dataset_root/training.jsonl")
+    with training_path.open(encoding="utf-8") as stream:
+        sample_count = sum(1 for line in stream if line.strip())
+    if sample_count != prior.num_samples:
+        raise ValueError(
+            f"RPB sample count does not match training data: prior={prior.num_samples} data={sample_count}"
+        )
+
+    expected = {
+        "model ID": (prior.metadata["model_id"], getattr(config.model, "hf_model_id", None)),
+        "tokenizer ID": (
+            prior.metadata["tokenizer_id"],
+            getattr(config.tokenizer, "tokenizer_model", None),
+        ),
+        "router score function": (
+            prior.metadata["router_score_function"],
+            getattr(config.model, "moe_router_score_function", None),
+        ),
+        "top-k": (prior.metadata["top_k"], getattr(config.model, "moe_router_topk", None)),
+        "maximum sequence length": (
+            prior.metadata["max_seq_len"],
+            getattr(config.dataset, "seq_length", None),
+        ),
+        "expert count": (prior.num_experts, getattr(config.model, "num_moe_experts", None)),
+    }
+    for label, (artifact_value, configured_value) in expected.items():
+        if configured_value is None or artifact_value != configured_value:
+            raise ValueError(
+                f"RPB {label} mismatch: artifact={artifact_value!r} config={configured_value!r}"
+            )
+
+
+def enable_rpb(config: Any, rpb: RPBConfig) -> Any:
+    validate_bridge_config(config, rpb)
+    reference = RPBPrior(rpb.prior_path)
+    validate_prior_alignment(config, reference)
+
+    from megatron.bridge.data.datasets.sft import GPTSFTDataset
+    from megatron.bridge.training import vlm_step
+
+    patch_sft_dataset_class(GPTSFTDataset)
+    patch_vlm_step_module(vlm_step)
+
+    def install_hook(model_chunks):
+        install_rpb_on_model(model_chunks, rpb, prior=reference)
+        return model_chunks
+
+    config.model.register_pre_wrap_hook(install_hook)
+    return config
